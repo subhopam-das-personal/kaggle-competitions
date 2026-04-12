@@ -1,0 +1,18 @@
+# Core
+torch>=2.4.0
+transformers>=5.3.0
+peft>=0.14.0
+trl>=0.17.0
+datasets
+accelerate
+einops
+
+# Quantization (for QLoRA on T4)
+bitsandbytes
+
+# Data
+pandas
+numpy
+
+# Testing
+pytest
