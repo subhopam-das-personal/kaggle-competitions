@@ -1,0 +1,22 @@
+{
+  "id": "subhopamdas/nemotron-sft-training-oracle-cot",
+  "title": "Nemotron SFT Training Oracle CoT",
+  "code_file": "train_sft_kaggle.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "dennisfong/nvidia-nemotron-offline-packages",
+    "subhopamdas/nemotron-reasoning-src"
+  ],
+  "competition_sources": [
+    "nvidia-nemotron-model-reasoning-challenge"
+  ],
+  "kernel_sources": [],
+  "model_sources": [
+    "metric/nemotron-3-nano-30b-a3b-bf16/transformers/default"
+  ]
+}

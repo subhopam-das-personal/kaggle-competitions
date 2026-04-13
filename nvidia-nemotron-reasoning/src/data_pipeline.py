@@ -15,11 +15,11 @@ import json
 import random
 import string
 import re
-import math
 from pathlib import Path
 from typing import Optional
 
 from .category_detector import detect_category, get_category_stats
+from .eval_harness import verify
 from .oracles import (
     solve, generate_cot,
     int_to_roman, solve_gravitational, solve_unit_conversion,
@@ -102,7 +102,7 @@ def process_training_data(
                     'verified': category == 'text_encryption',  # encryption answers are reliable
                 })
                 stats['included'] += 1
-        elif _answers_match(oracle_answer, ground_truth):
+        elif verify(oracle_answer, ground_truth):
             stats['oracle_correct'] += 1
             stats['per_category'][category]['oracle_correct'] += 1
             
@@ -142,20 +142,6 @@ def process_training_data(
     return stats
 
 
-def _answers_match(predicted: str, ground_truth: str) -> bool:
-    """Check if two answers match (same logic as eval harness)."""
-    if predicted.strip() == ground_truth.strip():
-        return True
-    if predicted.strip().lower() == ground_truth.strip().lower():
-        return True
-    try:
-        p = float(predicted.strip().replace(",", ""))
-        g = float(ground_truth.strip().replace(",", ""))
-        return math.isclose(p, g, rel_tol=1e-2, abs_tol=1e-5)
-    except (ValueError, OverflowError):
-        return False
-
-
 # ============================================================================
 # Synthetic data generators
 # ============================================================================
@@ -183,7 +169,7 @@ def generate_synthetic_gravitational(n: int, seed: int = 42) -> list[dict]:
         
         # Verify oracle agrees
         oracle_ans = solve_gravitational(prompt)
-        if oracle_ans and _answers_match(oracle_ans, answer):
+        if oracle_ans and verify(oracle_ans, answer):
             cot = gravitational_cot(prompt, answer)
             examples.append({
                 'messages': [
@@ -253,7 +239,7 @@ def generate_synthetic_unit_conversion(n: int, seed: int = 42) -> list[dict]:
         )
         
         oracle_ans = solve_unit_conversion(prompt)
-        if oracle_ans and _answers_match(oracle_ans, answer):
+        if oracle_ans and verify(oracle_ans, answer):
             cot = unit_conversion_cot(prompt, answer)
             examples.append({
                 'messages': [
@@ -405,7 +391,7 @@ def generate_synthetic_bit_manipulation(n: int, seed: int = 42) -> list[dict]:
                 {'role': 'assistant', 'content': f"<think>\n{cot}\n</think>\n\\boxed{{{answer}}}"},
             ],
             'category': 'bit_manipulation',
-            'verified': True,  # We KNOW the answer is correct because we generated it
+            'verified': verified,  # True only if oracle also confirmed the answer
             'synthetic': True,
         })
     
@@ -450,7 +436,7 @@ def generate_full_dataset(
         
         oracle_ans = solve(prompt, cat)
         
-        if oracle_ans is not None and _answers_match(oracle_ans, gt):
+        if oracle_ans is not None and verify(oracle_ans, gt):
             cot = generate_cot(prompt, oracle_ans, cat)
             real_examples.append({
                 'messages': [

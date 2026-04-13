@@ -499,6 +499,26 @@ def text_encryption_cot(prompt: str, answer: str) -> str:
 # Category 5: Bit Manipulation (HARD)
 # ============================================================================
 
+def _detect_bit_op_name(examples: list[tuple[int, int]]) -> Optional[str]:
+    """Return a human-readable name for the bit operation, or None if not a single op."""
+    single_ops = [
+        ("NOT", lambda x: (~x) & 0xFF),
+        ("reverse bits", lambda x: int(format(x, '08b')[::-1], 2)),
+        ("shift left 1", lambda x: (x << 1) & 0xFF),
+        ("shift right 1", lambda x: (x >> 1) & 0xFF),
+        ("rotate left 1", lambda x: ((x << 1) | (x >> 7)) & 0xFF),
+        ("rotate right 1", lambda x: ((x >> 1) | (x << 7)) & 0xFF),
+    ]
+    for const in range(256):
+        single_ops.append((f"XOR 0x{const:02X} ({const})", lambda x, c=const: x ^ c))
+        single_ops.append((f"AND 0x{const:02X} ({const})", lambda x, c=const: x & c))
+        single_ops.append((f"OR 0x{const:02X} ({const})", lambda x, c=const: x | c))
+    for name, op in single_ops:
+        if all(op(inp) == out for inp, out in examples):
+            return name
+    return None
+
+
 def solve_bit_manipulation(prompt: str) -> Optional[str]:
     """Attempt to solve bit manipulation problems.
     
@@ -662,27 +682,37 @@ def bit_manipulation_cot(prompt: str, answer: str) -> str:
         "",
     ])
     
-    # Try to explain the discovered pattern
+    # Try to identify the named operation first (gives the model a clear pattern label)
     examples = [(int(inp, 2), int(out, 2)) for inp, out in pairs]
-    
-    # Check per-bit
-    for bit_pos in range(8):
-        for src_pos in range(8):
-            for invert in [False, True]:
-                consistent = all(
-                    (((inp >> (7 - src_pos)) & 1) ^ int(invert)) == ((out >> (7 - bit_pos)) & 1)
-                    for inp, out in examples
-                )
-                if consistent:
-                    op = "NOT " if invert else ""
-                    lines.append(f"  Bit {bit_pos}: = {op}input_bit[{src_pos}]")
-                    break
+    op_name = _detect_bit_op_name(examples)
+    if op_name:
+        lines.extend([
+            f"Pattern recognized: {op_name}",
+            "",
+            "Verification against all examples:",
+        ])
+        for inp, out in pairs[:3]:
+            lines.append(f"  {inp} → apply {op_name} → {out} ✓")
+    else:
+        # Fall back to per-bit analysis for composite operations
+        lines.append("No single operation matches. Analyzing per-bit rules:")
+        for bit_pos in range(8):
+            for src_pos in range(8):
+                for invert in [False, True]:
+                    consistent = all(
+                        (((inp >> (7 - src_pos)) & 1) ^ int(invert)) == ((out >> (7 - bit_pos)) & 1)
+                        for inp, out in examples
+                    )
+                    if consistent:
+                        prefix = "NOT " if invert else ""
+                        lines.append(f"  Output bit {bit_pos} = {prefix}input bit {src_pos}")
+                        break
+                else:
+                    continue
+                break
             else:
-                continue
-            break
-        else:
-            lines.append(f"  Bit {bit_pos}: complex operation")
-    
+                lines.append(f"  Output bit {bit_pos}: complex (2-input op)")
+
     lines.extend([
         "",
         f"Applying the transformation to input: {query}",
@@ -696,107 +726,193 @@ def bit_manipulation_cot(prompt: str, answer: str) -> str:
 # Category 6: Equation Transformation (HARDEST)
 # ============================================================================
 
+def _constraint_propagate_digit(equations: list, symbols: list) -> dict:
+    """Use constraints from equations to narrow digit domain before brute-force.
+
+    Returns dict of symbol -> set_of_candidates. All symbols start with {0..9};
+    constraints that can uniquely determine a symbol's value are applied.
+    """
+    domains = {s: set(range(10)) for s in symbols}
+
+    # Propagate: for "A = <number>" patterns (single-symbol lhs), that symbol == number
+    for lhs, rhs in equations:
+        lhs_strip = lhs.strip()
+        try:
+            rhs_val = int(rhs.strip())
+        except ValueError:
+            continue
+        if lhs_strip in domains and 0 <= rhs_val <= 9:
+            domains[lhs_strip] = {rhs_val}
+
+    # Arc consistency: ensure no two symbols share the same forced value
+    changed = True
+    while changed:
+        changed = False
+        forced = {s: list(v)[0] for s, v in domains.items() if len(v) == 1}
+        for s, candidates in domains.items():
+            if len(candidates) > 1:
+                pruned = candidates - set(v for k, v in forced.items() if k != s)
+                if len(pruned) < len(candidates):
+                    domains[s] = pruned
+                    changed = True
+
+    return domains
+
+
+def _apply_digit_operator_mapping(expr: str, digit_map: dict, op_map: dict) -> Optional[str]:
+    """Apply both digit and operator symbol mappings to an expression string."""
+    result = ""
+    for c in expr:
+        if c in digit_map:
+            result += str(digit_map[c])
+        elif c in op_map:
+            result += op_map[c]
+        elif c in ' +-*/()'or c.isdigit():
+            result += c
+        elif c.isspace():
+            result += c
+        else:
+            return None
+    return result
+
+
 def solve_equation_transformation(prompt: str) -> Optional[str]:
     """Attempt to solve equation transformation problems.
-    
-    Strategy: infer symbol-to-digit bijection and operator mapping from
-    few-shot examples. This is computationally expensive for symbolic sub-cases.
-    
-    Returns None for cases that can't be solved (many symbolic cases).
+
+    Strategy: infer symbol-to-digit/operator bijection from few-shot examples,
+    then evaluate the query. Returns a numeric string (NOT re-encoded symbols).
+
+    Improvements over original:
+    - Returns numeric result directly (fixes answer re-encoding bug)
+    - Constraint propagation prunes digit domain before brute-force (handles 9+ symbols)
+    - Detects operator-position symbols and tries +/-/*/  assignments for them
     """
     # Split into examples and query
     parts = re.split(
         r'(?:Now,?\s*)?(?:determine|find|compute|calculate)\s+the\s+result\s+(?:for|of)[:\s]*',
         prompt, flags=re.IGNORECASE
     )
-    
+
     if len(parts) < 2:
         return None
-    
+
     examples_text = parts[0]
     query_text = parts[1].strip()
-    
+
     # Extract example equations: "expr = result"
     equations = re.findall(r'([^\n=]+?)\s*=\s*([^\n]+)', examples_text)
     equations = [
         (lhs.strip(), rhs.strip()) for lhs, rhs in equations
         if not any(w in lhs.lower() for w in ['wonderland', 'secret', 'below', 'rule', 'example'])
     ]
-    
+
     if not equations:
         return None
-    
-    # For numeric equation transformation: try to detect digit bijection
-    # This is a simplified solver - full solver would enumerate all permutations
-    
-    # Collect all unique non-operator symbols
+
+    # Collect all unique non-standard symbols
     all_text = " ".join(lhs + " " + rhs for lhs, rhs in equations) + " " + query_text
-    # Remove known operators and whitespace
     symbols = set()
     for c in all_text:
         if c not in ' +-*/=(){}[].,\n\t' and not c.isdigit():
             symbols.add(c)
-    
-    # If there are ≤ 10 unique symbols, try brute-force bijection to digits
-    if 1 <= len(symbols) <= 10:
-        symbol_list = sorted(symbols)
-        digits = list(range(10))
-        
-        # Try permutations (up to 10! = 3.6M, but usually fewer symbols)
-        # Limit search to avoid timeout
+
+    if not symbols:
+        return None
+
+    symbol_list = sorted(symbols)
+
+    # Detect operator-position symbols: appear as middle token in "A OP B" triples
+    op_symbols = set()
+    for lhs, rhs in equations:
+        tokens = lhs.split()
+        if len(tokens) == 3 and tokens[1] in symbols:
+            op_symbols.add(tokens[1])
+
+    digit_symbols = [s for s in symbol_list if s not in op_symbols]
+    op_symbol_list = [s for s in symbol_list if s in op_symbols]
+
+    operators = ['+', '-', '*', '/']
+    digits = list(range(10))
+
+    def _format_result(result_val: float) -> str:
+        if result_val == int(result_val):
+            return str(int(result_val))
+        return f"{result_val:.4f}".rstrip('0').rstrip('.')
+
+    # --- Strategy 1: pure digit bijection (no operator symbols detected) ---
+    if not op_symbols:
+        domains = _constraint_propagate_digit(equations, digit_symbols)
+        fixed = {s: list(v)[0] for s, v in domains.items() if len(v) == 1}
+        free_syms = [s for s in digit_symbols if s not in fixed]
+
         max_perms = 100000
         count = 0
-        
-        for perm in permutations(digits, len(symbol_list)):
+        for perm in permutations(digits, len(free_syms)):
             count += 1
             if count > max_perms:
                 break
-            
-            mapping = dict(zip(symbol_list, perm))
-            
-            # Verify against all examples
+
+            mapping = dict(fixed)
+            mapping.update(dict(zip(free_syms, perm)))
+
             valid = True
             for lhs, rhs in equations:
                 try:
-                    lhs_decoded = _apply_digit_mapping(lhs, mapping)
-                    rhs_decoded = _apply_digit_mapping(rhs, mapping)
-                    
-                    if lhs_decoded is None or rhs_decoded is None:
-                        valid = False
-                        break
-                    
-                    # Evaluate both sides
-                    lhs_val = _safe_eval(lhs_decoded)
-                    rhs_val = _safe_eval(rhs_decoded)
-                    
-                    if lhs_val is None or rhs_val is None:
-                        valid = False
-                        break
-                    
-                    if not math.isclose(lhs_val, rhs_val, rel_tol=1e-6):
-                        valid = False
-                        break
+                    lhs_dec = _apply_digit_mapping(lhs, mapping)
+                    rhs_dec = _apply_digit_mapping(rhs, mapping)
+                    if lhs_dec is None or rhs_dec is None:
+                        valid = False; break
+                    lv = _safe_eval(lhs_dec)
+                    rv = _safe_eval(rhs_dec)
+                    if lv is None or rv is None:
+                        valid = False; break
+                    if not math.isclose(lv, rv, rel_tol=1e-6):
+                        valid = False; break
                 except Exception:
-                    valid = False
-                    break
-            
+                    valid = False; break
+
             if valid:
-                # Apply mapping to query
                 result = _apply_digit_mapping(query_text, mapping)
                 if result is not None:
-                    result_val = _safe_eval(result)
-                    if result_val is not None:
-                        # Re-encode result back using the mapping
-                        reverse_mapping = {v: k for k, v in mapping.items()}
-                        result_str = str(int(result_val)) if result_val == int(result_val) else f"{result_val:.2f}"
-                        encoded = ""
-                        for c in result_str:
-                            if c.isdigit() and int(c) in reverse_mapping:
-                                encoded += reverse_mapping[int(c)]
-                            else:
-                                encoded += c
-                        return encoded
-    
+                    rv = _safe_eval(result)
+                    if rv is not None:
+                        return _format_result(rv)
+        return None
+
+    # --- Strategy 2: mixed digit + operator bijection ---
+    max_perms = 50000
+    count = 0
+    for op_perm in permutations(operators, min(len(op_symbol_list), len(operators))):
+        op_map = dict(zip(op_symbol_list, op_perm))
+        for digit_perm in permutations(digits, len(digit_symbols)):
+            count += 1
+            if count > max_perms:
+                return None
+            digit_map = dict(zip(digit_symbols, digit_perm))
+
+            valid = True
+            for lhs, rhs in equations:
+                try:
+                    lhs_dec = _apply_digit_operator_mapping(lhs, digit_map, op_map)
+                    rhs_dec = _apply_digit_operator_mapping(rhs, digit_map, op_map)
+                    if lhs_dec is None or rhs_dec is None:
+                        valid = False; break
+                    lv = _safe_eval(lhs_dec)
+                    rv = _safe_eval(rhs_dec)
+                    if lv is None or rv is None:
+                        valid = False; break
+                    if not math.isclose(lv, rv, rel_tol=1e-6):
+                        valid = False; break
+                except Exception:
+                    valid = False; break
+
+            if valid:
+                result = _apply_digit_operator_mapping(query_text, digit_map, op_map)
+                if result is not None:
+                    rv = _safe_eval(result)
+                    if rv is not None:
+                        return _format_result(rv)
+
     return None
 
 
@@ -830,37 +946,101 @@ def _safe_eval(expr: str) -> Optional[float]:
 
 
 def equation_transformation_cot(prompt: str, answer: str) -> str:
-    """Generate CoT for equation transformation."""
+    """Generate step-by-step CoT for equation transformation.
+
+    Teaches the meta-skill explicitly:
+      Step 1: List all unique symbols
+      Step 2: Extract the bijection table from examples (show which value each symbol maps to)
+      Step 3: Substitute the mapping into the query expression
+      Step 4: Evaluate and state the answer
+    """
     parts = re.split(
         r'(?:Now,?\s*)?(?:determine|find|compute|calculate)\s+the\s+result\s+(?:for|of)[:\s]*',
         prompt, flags=re.IGNORECASE
     )
-    
+
     examples_text = parts[0] if parts else prompt
+    query_text = parts[1].strip() if len(parts) > 1 else ""
+
     equations = re.findall(r'([^\n=]+?)\s*=\s*([^\n]+)', examples_text)
     equations = [
         (lhs.strip(), rhs.strip()) for lhs, rhs in equations
         if not any(w in lhs.lower() for w in ['wonderland', 'secret', 'below', 'rule', 'example'])
     ]
-    
+
+    # Collect symbols
+    all_text = " ".join(lhs + " " + rhs for lhs, rhs in equations) + " " + query_text
+    symbols = sorted(set(
+        c for c in all_text
+        if c not in ' +-*/=(){}[].,\n\t' and not c.isdigit()
+    ))
+
+    # Try to recover the actual mapping by running the oracle
+    mapping_str = ""
+    recovered_mapping = None
+    try:
+        # Try pure digit mapping first via brute-force (small set)
+        from itertools import permutations as _perms
+        if 1 <= len(symbols) <= 6:
+            for perm in _perms(range(10), len(symbols)):
+                trial = dict(zip(symbols, perm))
+                all_valid = True
+                for lhs, rhs in equations:
+                    lhs_dec = _apply_digit_mapping(lhs, trial)
+                    rhs_dec = _apply_digit_mapping(rhs, trial)
+                    if lhs_dec is None or rhs_dec is None:
+                        all_valid = False; break
+                    lv = _safe_eval(lhs_dec)
+                    rv = _safe_eval(rhs_dec)
+                    if lv is None or rv is None or not math.isclose(lv, rv, rel_tol=1e-6):
+                        all_valid = False; break
+                if all_valid:
+                    recovered_mapping = trial
+                    break
+    except Exception:
+        pass
+
     lines = [
-        "I need to find the transformation rules from the examples.",
-        "Each example shows an equation where symbols map to digits and/or operators.",
+        "I need to decode the symbol-to-digit mapping from the given examples.",
         "",
-        "Given examples:",
+        "Step 1: Identify all unique symbols.",
+        f"  Symbols found: {', '.join(symbols) if symbols else '(none)'}",
+        "",
+        "Step 2: Extract the bijection table.",
     ]
-    for lhs, rhs in equations[:5]:
-        lines.append(f"  {lhs} = {rhs}")
-    
+
+    if recovered_mapping:
+        lines.append("  From the examples, the mapping is:")
+        for sym in symbols:
+            if sym in recovered_mapping:
+                lines.append(f"    {sym} → {recovered_mapping[sym]}")
+    else:
+        lines.append("  Testing symbol assignments against each example:")
+        for lhs, rhs in equations[:3]:
+            lines.append(f"    {lhs} = {rhs}")
+
     lines.extend([
         "",
-        "Step 1: Identify all unique symbols in the equations.",
-        "Step 2: For each possible digit-to-symbol bijection, check consistency with all examples.",
-        "Step 3: Apply the discovered mapping to the query.",
-        "",
-        f"After testing bijections, the correct answer is: {answer}",
+        "Step 3: Substitute the mapping into the query expression.",
     ])
-    
+
+    if recovered_mapping and query_text:
+        decoded_query = _apply_digit_mapping(query_text, recovered_mapping)
+        if decoded_query:
+            lines.append(f"  Query: {query_text}")
+            lines.append(f"  After substitution: {decoded_query}")
+            lines.append(f"  Evaluating: {decoded_query} = {answer}")
+        else:
+            lines.append(f"  Query: {query_text} → {answer}")
+    else:
+        lines.append(f"  Query: {query_text} → {answer}")
+
+    lines.extend([
+        "",
+        "Step 4: The result is:",
+        f"  {answer}",
+    ])
+
     return "\n".join(lines)
 
 
@@ -870,7 +1050,10 @@ def equation_transformation_cot(prompt: str, answer: str) -> str:
 
 def solve(prompt: str, category: Optional[str] = None) -> Optional[str]:
     """Attempt to solve any problem. Returns answer or None."""
-    from .category_detector import detect_category
+    try:
+        from category_detector import detect_category
+    except ImportError:
+        from .category_detector import detect_category
     
     if category is None:
         category = detect_category(prompt)
