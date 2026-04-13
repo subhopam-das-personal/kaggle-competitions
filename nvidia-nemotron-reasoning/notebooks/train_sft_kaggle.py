@@ -74,6 +74,29 @@ def pip_install(packages):
             capture_output=True, timeout=300
         )
 
+# Install mamba-ssm and causal-conv1d from offline wheels if available
+# NemotronH uses Mamba-2 which requires these compiled CUDA extensions
+_OFFLINE_DIRS = [
+    "/kaggle/input/datasets/dennisfong/nvidia-nemotron-offline-packages/offline_packages/",
+    "/kaggle/usr/lib/notebooks/ryanholbrook/nvidia_utility_script/",
+]
+_mamba_installed = False
+for _odir in _OFFLINE_DIRS:
+    if os.path.exists(_odir):
+        _wheels = glob.glob(f"{_odir}/**/*causal_conv1d*.whl", recursive=True)
+        _mamba_wheels = glob.glob(f"{_odir}/**/*mamba_ssm*.whl", recursive=True)
+        if _wheels and _mamba_wheels:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--no-index",
+                f"--find-links={_odir}", "causal-conv1d", "mamba-ssm"], check=False)
+            _mamba_installed = True
+            print(f"✓ causal-conv1d and mamba-ssm installed from {_odir}")
+            break
+if not _mamba_installed:
+    # Try from PyPI (requires internet)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+        "causal-conv1d", "mamba-ssm"], capture_output=True)
+    print("⚠ mamba packages installed from PyPI (internet required)")
+
 # CRITICAL: transformers >= 5.3.0 fixes the KV cache bug
 pip_install([
     "transformers>=5.3.0",
@@ -83,6 +106,7 @@ pip_install([
     "accelerate",
     "einops",
     "bitsandbytes",
+    "kagglehub",
 ])
 
 # Verify critical version
@@ -105,15 +129,17 @@ CONFIG = {
     "model_name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     
     # LoRA — MUST be rank ≤ 32 per competition rules
+    # Evaluator uses max_lora_rank=32 and max_tokens=7680
     "lora_r": 32,
     "lora_alpha": 32,
-    "lora_dropout": 0.05,
-    # all-linear EXCEPT router gate (unstable on MoE)
-    "target_modules": "all-linear",
-    "modules_to_exclude": ["router"],  # exclude MoE router gate
+    "lora_dropout": 0.0,  # 0 at eval → train with 0 for consistency
+    # Proven target modules for NemotronH (Mamba + MoE layers only, avoids router)
+    # Do NOT use "all-linear" — evaluator's vLLM rejects adapters targeting router/lm_head
+    "target_modules": r".*\.(in_proj|out_proj|up_proj|down_proj)$",
     
     # Training
-    "max_seq_length": 2048,  # Keep short for easy categories; saves VRAM
+    # Match evaluator max_tokens=7680 to avoid truncating CoT at inference time
+    "max_seq_length": 7680,
     "num_train_epochs": 2,
     "per_device_train_batch_size": 1,
     "gradient_accumulation_steps": 16,  # effective batch = 16
@@ -133,23 +159,29 @@ CONFIG = {
     "submission_path": "/kaggle/working/submission.zip",
 }
 
-# Auto-detect model path from Kaggle inputs
-MODEL_PATH = CONFIG["model_name"]
-if os.path.exists("/kaggle/input"):
-    for root, dirs, files in os.walk("/kaggle/input"):
-        if "config.json" in files:
-            try:
-                with open(os.path.join(root, "config.json")) as f:
-                    cfg = json.load(f)
-                if "nemotron" in str(cfg.get("architectures", "")).lower():
-                    MODEL_PATH = root
-                    print(f"✓ Found model at: {root}")
-                    break
-            except Exception:
-                pass
-        # Don't recurse into model subdirs
-        if "config.json" in files:
-            dirs.clear()
+# Load model via kagglehub (same as the competition evaluator)
+# This downloads/caches the official competition model
+try:
+    import kagglehub
+    MODEL_PATH = kagglehub.model_download("metric/nemotron-3-nano-30b-a3b-bf16/transformers/default")
+    print(f"✓ Model path (kagglehub): {MODEL_PATH}")
+except Exception as _e:
+    print(f"⚠ kagglehub failed ({_e}), falling back to local scan")
+    MODEL_PATH = CONFIG["model_name"]
+    if os.path.exists("/kaggle/input"):
+        for root, dirs, files in os.walk("/kaggle/input"):
+            if "config.json" in files:
+                try:
+                    with open(os.path.join(root, "config.json")) as f:
+                        cfg = json.load(f)
+                    if "nemotron" in str(cfg.get("architectures", "")).lower():
+                        MODEL_PATH = root
+                        print(f"✓ Found model at: {root}")
+                        break
+                except Exception:
+                    pass
+            if "config.json" in files:
+                dirs.clear()
 
 if MODEL_PATH == CONFIG["model_name"]:
     print(f"⚠ Model not found locally, will download: {MODEL_PATH}")
@@ -366,6 +398,97 @@ def solve_bit_manipulation(prompt):
         return format(result, '08b')
     return None
 
+def solve_equation_transformation_local(prompt):
+    """Solve equation transformation via symbol bijection search."""
+    import math as _math
+    from itertools import permutations as _perms
+
+    parts = re.split(
+        r'(?:Now,?\s*)?(?:determine|find|compute|calculate)\s+the\s+result\s+(?:for|of)[:\s]*',
+        prompt, flags=re.IGNORECASE
+    )
+    if len(parts) < 2:
+        return None
+
+    examples_text, query_text = parts[0], parts[1].strip()
+    equations = re.findall(r'([^\n=]+?)\s*=\s*([^\n]+)', examples_text)
+    equations = [
+        (lhs.strip(), rhs.strip()) for lhs, rhs in equations
+        if not any(w in lhs.lower() for w in ['wonderland', 'secret', 'below', 'rule', 'example'])
+    ]
+    if not equations:
+        return None
+
+    all_text = " ".join(lhs + " " + rhs for lhs, rhs in equations) + " " + query_text
+    symbols = sorted(set(c for c in all_text
+                         if c not in ' +-*/=(){}[].,\n\t' and not c.isdigit()))
+    if not symbols:
+        return None
+
+    # Detect operator-position symbols
+    op_symbols = set()
+    for lhs, _ in equations:
+        tokens = lhs.split()
+        if len(tokens) == 3 and tokens[1] in symbols:
+            op_symbols.add(tokens[1])
+
+    digit_syms = [s for s in symbols if s not in op_symbols]
+    op_syms = [s for s in symbols if s in op_symbols]
+
+    def apply_map(expr, dm, om={}):
+        out = ""
+        for c in expr:
+            if c in dm: out += str(dm[c])
+            elif c in om: out += om[c]
+            elif c in ' +-*/()' or c.isdigit(): out += c
+            else: return None
+        return out
+
+    def safe_eval(expr):
+        try:
+            cleaned = expr.strip()
+            if not re.match(r'^[\d\s+\-*/().]+$', cleaned):
+                return None
+            return float(eval(cleaned, {"__builtins__": {}}, {}))
+        except Exception:
+            return None
+
+    def fmt(v):
+        return str(int(v)) if v == int(v) else f"{v:.4f}".rstrip('0').rstrip('.')
+
+    operators = ['+', '-', '*', '/']
+    digits = list(range(10))
+    max_count = 100000
+    count = 0
+
+    op_perms = list(_perms(operators, min(len(op_syms), len(operators)))) if op_syms else [()]
+    for op_perm in op_perms:
+        om = dict(zip(op_syms, op_perm)) if op_syms else {}
+        for digit_perm in _perms(digits, len(digit_syms)):
+            count += 1
+            if count > max_count:
+                return None
+            dm = dict(zip(digit_syms, digit_perm))
+            valid = True
+            for lhs, rhs in equations:
+                try:
+                    ld = apply_map(lhs, dm, om)
+                    rd = apply_map(rhs, dm, om)
+                    if ld is None or rd is None: valid = False; break
+                    lv = safe_eval(ld); rv = safe_eval(rd)
+                    if lv is None or rv is None: valid = False; break
+                    if not _math.isclose(lv, rv, rel_tol=1e-6): valid = False; break
+                except Exception:
+                    valid = False; break
+            if valid:
+                r = apply_map(query_text, dm, om)
+                if r is not None:
+                    rv = safe_eval(r)
+                    if rv is not None:
+                        return fmt(rv)
+    return None
+
+
 def solve(prompt, category=None):
     if category is None:
         category = detect_category(prompt)
@@ -375,6 +498,7 @@ def solve(prompt, category=None):
         'unit_conversion': solve_unit_conversion,
         'text_encryption': solve_text_encryption,
         'bit_manipulation': solve_bit_manipulation,
+        'equation_transformation': solve_equation_transformation_local,
     }
     solver = solvers.get(category)
     if solver:
@@ -471,7 +595,47 @@ def bit_cot(prompt, answer):
     return "\n".join(lines)
 
 def eq_cot(prompt, answer):
-    return f"Analyzing transformation rules from examples.\nApplying to query: {answer}"
+    """Generate step-by-step CoT for equation transformation.
+
+    Explicitly teaches: extract symbol table → substitute → evaluate.
+    """
+    parts = re.split(
+        r'(?:Now,?\s*)?(?:determine|find|compute|calculate)\s+the\s+result\s+(?:for|of)[:\s]*',
+        prompt, flags=re.IGNORECASE
+    )
+    examples_text = parts[0] if parts else prompt
+    query_text = parts[1].strip() if len(parts) > 1 else ""
+
+    equations = re.findall(r'([^\n=]+?)\s*=\s*([^\n]+)', examples_text)
+    equations = [
+        (lhs.strip(), rhs.strip()) for lhs, rhs in equations
+        if not any(w in lhs.lower() for w in ['wonderland', 'secret', 'below', 'rule', 'example'])
+    ]
+
+    all_text = " ".join(lhs + " " + rhs for lhs, rhs in equations) + " " + query_text
+    symbols = sorted(set(c for c in all_text
+                         if c not in ' +-*/=(){}[].,\n\t' and not c.isdigit()))
+
+    lines = [
+        "I need to decode the symbol mapping from the given examples.",
+        "",
+        f"Step 1: Unique symbols found: {', '.join(symbols) if symbols else '(none)'}",
+        "",
+        "Step 2: Determine the bijection by testing assignments against each example:",
+    ]
+    for lhs, rhs in equations[:4]:
+        lines.append(f"  {lhs} = {rhs}")
+
+    lines.extend([
+        "",
+        "Step 3: Apply the discovered mapping to the query expression.",
+        f"  Query: {query_text}",
+        f"  After substitution and evaluation: {answer}",
+        "",
+        "Step 4: The result is:",
+        f"  {answer}",
+    ])
+    return "\n".join(lines)
 
 def generate_cot(prompt, answer, category):
     cot_fns = {
@@ -614,6 +778,119 @@ def gen_synthetic_bit(n, rng):
                      'category': 'bit_manipulation'})
     return out
 
+def gen_synthetic_eq_transform(n, rng):
+    """Generate equation_transformation examples with proper CoT.
+
+    Each example uses a random digit bijection (and optionally operator bijection).
+    Produces problems that look like the competition format.
+    """
+    import unicodedata
+    # Greek letters as symbol pool (same as competition)
+    GREEK = list("αβγδεζηθικλμνξοπρστυφχψω")
+    OPERATORS = ['+', '-', '*']  # avoid '/' to keep integer answers
+    out = []
+    for _ in range(n):
+        n_symbols = rng.randint(2, 5)
+        chosen = rng.sample(GREEK, n_symbols)
+
+        # Randomly decide if one symbol maps to an operator
+        use_op_sym = rng.random() < 0.3 and n_symbols >= 3
+        if use_op_sym:
+            op_sym = rng.choice(chosen[1:])  # don't make the first sym an operator
+            digit_syms = [s for s in chosen if s != op_sym]
+            op_val = rng.choice(OPERATORS)
+        else:
+            op_sym = None
+            digit_syms = chosen
+            op_val = None
+
+        # Assign digit values (1-9, avoid 0 to prevent divide issues)
+        available_digits = list(range(1, 10))
+        rng.shuffle(available_digits)
+        digit_map = dict(zip(digit_syms, available_digits[:len(digit_syms)]))
+
+        def encode(val):
+            # Find which symbol maps to this digit
+            for s, v in digit_map.items():
+                if v == val:
+                    return s
+            return str(val)
+
+        def apply(expr_parts):
+            """expr_parts is list of (sym_or_digit, is_operator)"""
+            result = ""
+            for tok in expr_parts:
+                if tok in digit_map:
+                    result += str(digit_map[tok])
+                elif tok == op_sym:
+                    result += op_val if op_val else tok
+                elif tok in '+-*':
+                    result += tok
+                else:
+                    result += str(tok)
+            return result
+
+        # Generate example equations: A op B = C
+        n_examples = rng.randint(3, 5)
+        examples = []
+        for _ in range(n_examples):
+            a_sym = rng.choice(digit_syms)
+            b_sym = rng.choice(digit_syms)
+            a_val = digit_map[a_sym]
+            b_val = digit_map[b_sym]
+
+            if use_op_sym:
+                op_char = op_val
+                lhs_str = f"{a_sym} {op_sym} {b_sym}"
+            else:
+                op_char = rng.choice(OPERATORS)
+                lhs_str = f"{a_sym} {op_char} {b_sym}"
+
+            try:
+                rhs_val = int(eval(f"{a_val} {op_char} {b_val}"))
+            except Exception:
+                continue
+            examples.append((lhs_str, str(rhs_val)))
+
+        if not examples:
+            continue
+
+        # Query
+        q_a = rng.choice(digit_syms)
+        q_b = rng.choice(digit_syms)
+        qa_val = digit_map[q_a]
+        qb_val = digit_map[q_b]
+        if use_op_sym:
+            q_op_char = op_val
+            query_str = f"{q_a} {op_sym} {q_b}"
+        else:
+            q_op_char = rng.choice(OPERATORS)
+            query_str = f"{q_a} {q_op_char} {q_b}"
+
+        try:
+            answer_val = int(eval(f"{qa_val} {q_op_char} {qb_val}"))
+        except Exception:
+            continue
+        answer = str(answer_val)
+
+        ex_lines = "\n".join(f"{lhs} = {rhs}" for lhs, rhs in examples)
+        prompt = (
+            "In Alice's Wonderland, transformation rules map symbols to digits and operators. "
+            "The examples below follow a consistent bijection:\n"
+            f"{ex_lines}\n"
+            f"Now, determine the result for: {query_str}"
+        )
+        cot = generate_cot(prompt, answer, 'equation_transformation')
+        out.append({
+            'messages': [
+                {'role': 'user', 'content': prompt},
+                {'role': 'assistant', 'content': cot},
+            ],
+            'category': 'equation_transformation',
+        })
+    return out
+
+
 print("✓ Synthetic generators ready")
 
 # %% [markdown]
@@ -704,6 +981,7 @@ rng = random.Random(42)
 SYNTH_EASY = 500
 SYNTH_ENC = 300
 SYNTH_BIT = 800
+SYNTH_EQ = 800  # Equation transformation: 5-10x augmentation vs ~50-100 oracle-verified
 
 synth = []
 synth.extend(gen_synthetic_grav(SYNTH_EASY, rng))
@@ -711,6 +989,7 @@ synth.extend(gen_synthetic_roman(SYNTH_EASY, rng))
 synth.extend(gen_synthetic_unit(SYNTH_EASY, rng))
 synth.extend(gen_synthetic_enc(SYNTH_ENC, rng))
 synth.extend(gen_synthetic_bit(SYNTH_BIT, rng))
+synth.extend(gen_synthetic_eq_transform(SYNTH_EQ, rng))
 
 print(f"  Generated {len(synth)} synthetic examples")
 
@@ -798,6 +1077,8 @@ lora_config = LoraConfig(
     r=CONFIG["lora_r"],
     lora_alpha=CONFIG["lora_alpha"],
     lora_dropout=CONFIG["lora_dropout"],
+    # Regex targets in_proj/out_proj (Mamba) + up_proj/down_proj (MoE experts)
+    # This is the proven-working pattern for NemotronH hybrid architecture
     target_modules=CONFIG["target_modules"],
     modules_to_save=None,
     bias="none",
@@ -805,6 +1086,10 @@ lora_config = LoraConfig(
 )
 
 model = get_peft_model(model, lora_config)
+
+# Debug: show actual attention layer names (run this BEFORE assuming target_modules is right)
+proj_layers = [n for n, _ in model.named_modules() if 'proj' in n.lower()]
+print(f"Projection layers (first 40): {proj_layers[:40]}")
 
 # Ensure LoRA params are in BF16
 cast_count = 0
@@ -817,6 +1102,15 @@ if cast_count:
 
 model.print_trainable_parameters()
 print(f"LoRA rank={CONFIG['lora_r']}, alpha={CONFIG['lora_alpha']}")
+
+# FATAL guard: if 0 trainable params, target_modules matched nothing
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+assert trainable_params > 0, (
+    f"FATAL: LoRA adapter has 0 trainable parameters. "
+    f"target_modules regex '{CONFIG['target_modules']}' matched no layers. "
+    f"Check proj_layers above and update target_modules to match."
+)
+print(f"✓ {trainable_params:,} trainable parameters confirmed")
 
 # %% [markdown]
 # # Cell 7: Format Dataset & Train
@@ -873,7 +1167,7 @@ sft_config = SFTConfig(
     save_total_limit=2,
     max_seq_length=CONFIG["max_seq_length"],
     dataset_text_field="text",
-    packing=False,
+    packing=True,
     report_to="none",
     seed=42,
     dataloader_num_workers=0,  # Avoid multiprocessing issues on Kaggle
@@ -995,5 +1289,63 @@ except Exception as e:
     print(f"  Validation skipped (non-critical): {e}")
 
 print(f"\n{'='*70}")
-print("DONE! Submit {submission_path} to the competition.")
+print(f"DONE! submission.zip saved at: {submission_path}")
 print(f"{'='*70}")
+
+# %% [markdown]
+# # Cell 10: Auto-Submit to Kaggle (uses KAGGLE_KEY secret)
+
+# %%
+# Reads KAGGLE_KEY from Kaggle notebook secrets (Settings → Add secret → KAGGLE_KEY).
+# Set the secret value to your Kaggle API key (from https://www.kaggle.com/settings).
+# If the secret is absent, prints instructions and skips — training output is still saved.
+
+print("\n" + "=" * 70)
+print("Auto-submitting to Kaggle...")
+print("=" * 70)
+
+try:
+    from kaggle_secrets import UserSecretsClient
+    secrets = UserSecretsClient()
+    kaggle_key = secrets.get_secret("KAGGLE_KEY")
+    kaggle_user = secrets.get_secret("KAGGLE_USER") if "KAGGLE_USER" in dir(secrets) else "subhopamdas"
+except Exception:
+    kaggle_key = os.environ.get("KAGGLE_KEY", "")
+    kaggle_user = os.environ.get("KAGGLE_USER", "subhopamdas")
+
+if not kaggle_key:
+    print("⚠ KAGGLE_KEY secret not set.")
+    print("  To enable auto-submit: Settings → Secrets → Add secret → KAGGLE_KEY = <your api key>")
+    print(f"  Submission zip is at: {submission_path}")
+    print("  Download it and run:")
+    print(f"    kaggle competitions submit -c nvidia-nemotron-model-reasoning-challenge -f submission.zip -m 'SFT LoRA rank-32'")
+else:
+    import json as _json
+    from pathlib import Path as _Path
+    _kaggle_dir = _Path.home() / ".kaggle"
+    _kaggle_dir.mkdir(exist_ok=True)
+    _kaggle_json = _kaggle_dir / "kaggle.json"
+    # Preserve existing username if credentials already configured
+    if _kaggle_json.exists():
+        _existing = _json.loads(_kaggle_json.read_text())
+        _user = _existing.get("username", kaggle_user)
+    else:
+        _user = kaggle_user
+    _kaggle_json.write_text(_json.dumps({"username": _user, "key": kaggle_key}))
+    _kaggle_json.chmod(0o600)
+
+    _result = subprocess.run(
+        ["kaggle", "competitions", "submit",
+         "-c", "nvidia-nemotron-model-reasoning-challenge",
+         "-f", str(submission_path),
+         "-m", f"SFT LoRA rank-{CONFIG['lora_r']} — oracle-verified CoT"],
+        capture_output=True, text=True
+    )
+    print(_result.stdout)
+    if _result.stderr:
+        print("STDERR:", _result.stderr)
+    if _result.returncode == 0:
+        print("✓ Submission successful!")
+    else:
+        print(f"✗ Auto-submit failed (exit {_result.returncode}). Download submission.zip manually.")
+print("=" * 70)
