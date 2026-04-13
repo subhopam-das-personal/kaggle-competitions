@@ -951,13 +951,25 @@ for _, row in df.iterrows():
         })
         verified_count += 1
     elif oracle_ans is not None:
-        discarded_count += 1  # Oracle disagrees with ground truth
+        # Oracle disagrees with ground truth
+        if cat == 'equation_transformation':
+            # For equation_transformation, accept ground truth (oracle can't solve this category)
+            cot = generate_cot(prompt, gt, cat)
+            all_data.append({
+                'messages': [
+                    {'role': 'user', 'content': prompt},
+                    {'role': 'assistant', 'content': cot},
+                ],
+                'category': cat,
+            })
+            unsolvable_count += 1
+        else:
+            discarded_count += 1  # Oracle disagrees with ground truth for other categories
     else:
         unsolvable_count += 1
         # text_encryption: oracle returns None when mapping is incomplete,
         # but provided answers are still correct. Include them.
-        # equation_transformation: include with original answer (risky but
-        # better than nothing for this hard category).
+        # equation_transformation: include with original answer (oracle returns None)
         if cat in ('text_encryption', 'equation_transformation'):
             cot = generate_cot(prompt, gt, cat)
             all_data.append({
@@ -981,7 +993,9 @@ rng = random.Random(42)
 SYNTH_EASY = 500
 SYNTH_ENC = 300
 SYNTH_BIT = 800
-SYNTH_EQ = 800  # Equation transformation: 5-10x augmentation vs ~50-100 oracle-verified
+# SYNTH_EQ disabled: competition's equation_transformation is arbitrary custom operations
+# (e.g., 34/44=1 where / is per-problem custom rule), not digit bijections.
+# Synthetic bijection data would teach the wrong pattern.
 
 synth = []
 synth.extend(gen_synthetic_grav(SYNTH_EASY, rng))
@@ -989,7 +1003,7 @@ synth.extend(gen_synthetic_roman(SYNTH_EASY, rng))
 synth.extend(gen_synthetic_unit(SYNTH_EASY, rng))
 synth.extend(gen_synthetic_enc(SYNTH_ENC, rng))
 synth.extend(gen_synthetic_bit(SYNTH_BIT, rng))
-synth.extend(gen_synthetic_eq_transform(SYNTH_EQ, rng))
+# synth.extend(gen_synthetic_eq_transform(SYNTH_EQ, rng))  # Disabled - wrong problem type
 
 print(f"  Generated {len(synth)} synthetic examples")
 
