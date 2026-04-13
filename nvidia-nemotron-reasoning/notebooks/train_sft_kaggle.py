@@ -74,32 +74,101 @@ def pip_install(packages):
             capture_output=True, timeout=300
         )
 
-# Install mamba-ssm and causal-conv1d from offline wheels if available
-# NemotronH uses Mamba-2 which requires these compiled CUDA extensions
-_OFFLINE_DIRS = [
-    "/kaggle/input/datasets/dennisfong/nvidia-nemotron-offline-packages/offline_packages/",
-    "/kaggle/usr/lib/notebooks/ryanholbrook/nvidia_utility_script/",
-]
-_mamba_installed = False
-for _odir in _OFFLINE_DIRS:
-    if os.path.exists(_odir):
-        _wheels = glob.glob(f"{_odir}/**/*causal_conv1d*.whl", recursive=True)
-        _mamba_wheels = glob.glob(f"{_odir}/**/*mamba_ssm*.whl", recursive=True)
-        if _wheels and _mamba_wheels:
-            subprocess.run([sys.executable, "-m", "pip", "install", "--no-index",
-                f"--find-links={_odir}", "causal-conv1d", "mamba-ssm"], check=False)
-            _mamba_installed = True
-            print(f"✓ causal-conv1d and mamba-ssm installed from {_odir}")
-            break
-if not _mamba_installed:
-    # Try from PyPI (requires internet)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-        "causal-conv1d", "mamba-ssm"], capture_output=True)
-    print("⚠ mamba packages installed from PyPI (internet required)")
+# Strategy: prefer transformers >= 5.3.0 (native NemotronH, no mamba-ssm needed)
+# This is the correct path for new GPUs like Blackwell (sm_120) where mamba-ssm
+# has no prebuilt wheels and silent PyPI installs produce incompatible binaries.
+USE_TRUST_REMOTE_CODE = False  # Set True only if native transformers path is unavailable
 
-# CRITICAL: transformers >= 5.3.0 fixes the KV cache bug
+import importlib.metadata as _meta
+_tf_ver_str = _meta.version("transformers")
+_tf_ver = tuple(int(x) for x in _tf_ver_str.split('.')[:2])
+
+if _tf_ver >= (5, 3):
+    print(f"✓ transformers {_tf_ver_str} — native NemotronH (no mamba-ssm needed)")
+else:
+    print(f"transformers {_tf_ver_str} < 5.3.0, upgrading for native NemotronH support...")
+    _result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "transformers>=5.3.0"],
+        capture_output=True, text=True, timeout=300
+    )
+    # Check new version via subprocess to avoid stale import cache
+    _ver_check = subprocess.run(
+        [sys.executable, "-c", "import transformers; print(transformers.__version__)"],
+        capture_output=True, text=True
+    )
+    _new_ver = _ver_check.stdout.strip()
+    _new_tf_ver = tuple(int(x) for x in _new_ver.split('.')[:2]) if _new_ver else (0, 0)
+    if _new_tf_ver >= (5, 3):
+        print(f"✓ transformers upgraded to {_new_ver} — native NemotronH, no mamba-ssm needed")
+    else:
+        print(f"⚠ transformers upgrade failed (still {_new_ver or _tf_ver_str}), falling back to mamba-ssm path")
+        if _result.stderr:
+            print(f"  Upgrade error: {_result.stderr[-400:]}")
+        USE_TRUST_REMOTE_CODE = True
+
+# Install mamba-ssm ONLY if the native transformers path is unavailable
+if USE_TRUST_REMOTE_CODE:
+    print("Installing mamba-ssm and causal-conv1d (required for transformers < 5.3.0 path)...")
+
+    _OFFLINE_DIRS = [
+        "/kaggle/input/datasets/dennisfong/nvidia-nemotron-offline-packages/offline_packages/",
+        "/kaggle/usr/lib/notebooks/ryanholbrook/nvidia_utility_script/",
+    ]
+    _mamba_installed = False
+    for _odir in _OFFLINE_DIRS:
+        if os.path.exists(_odir):
+            _wheels = glob.glob(f"{_odir}/**/*causal_conv1d*.whl", recursive=True)
+            _mamba_wheels = glob.glob(f"{_odir}/**/*mamba_ssm*.whl", recursive=True)
+            if _wheels and _mamba_wheels:
+                _res = subprocess.run([sys.executable, "-m", "pip", "install", "--no-index",
+                    f"--find-links={_odir}", "causal-conv1d", "mamba-ssm"],
+                    capture_output=True, text=True)
+                if _res.returncode == 0:
+                    _mamba_installed = True
+                    print(f"✓ Installed from offline packages at {_odir}")
+                break
+
+    if not _mamba_installed:
+        print("Offline packages not found, installing from PyPI...")
+        _res = subprocess.run([sys.executable, "-m", "pip", "install",
+            "causal-conv1d", "mamba-ssm"], capture_output=True, text=True, timeout=600)
+        if _res.returncode == 0:
+            _mamba_installed = True
+            print("✓ Installed from PyPI")
+        else:
+            print(f"✗ PyPI install failed: {_res.stderr[-300:]}")
+
+    # Verify mamba-ssm actually imports (PyPI may install incompatible wheel silently)
+    try:
+        import mamba_ssm
+        import causal_conv1d
+        print("✓ mamba_ssm imported successfully")
+    except ImportError as _e:
+        # Last resort: build from source for the specific GPU compute capability
+        _cc = torch.cuda.get_device_properties(0)
+        _arch = f"{_cc.major}.{_cc.minor}"
+        print(f"Wheels incompatible ({_e}), building from source for sm_{_cc.major}{_cc.minor}...")
+        _env = os.environ.copy()
+        _env["TORCH_CUDA_ARCH_LIST"] = _arch
+        _res = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-build-isolation",
+             "git+https://github.com/Dao-AILab/causal-conv1d.git",
+             "git+https://github.com/state-spaces/mamba.git"],
+            capture_output=True, text=True, timeout=1200, env=_env
+        )
+        try:
+            import mamba_ssm
+            import causal_conv1d
+            print(f"✓ mamba_ssm compiled from source for sm_{_cc.major}{_cc.minor}")
+        except ImportError:
+            raise RuntimeError(
+                f"Cannot load NemotronH: transformers>=5.3.0 upgrade failed AND "
+                f"mamba-ssm failed to build for sm_{_cc.major}{_cc.minor}.\n"
+                f"Compile errors:\n{_res.stderr[-500:]}\n"
+                f"Fix: ensure internet access, or add 'nvidia-nemotron-offline-packages' as input."
+            )
+
 pip_install([
-    "transformers>=5.3.0",
     "peft>=0.14.0",
     "trl>=0.17.0",
     "datasets",
@@ -109,15 +178,9 @@ pip_install([
     "kagglehub",
 ])
 
-# Verify critical version
 import transformers
-tf_version = tuple(int(x) for x in transformers.__version__.split('.')[:2])
 print(f"transformers: {transformers.__version__}")
-assert tf_version >= (5, 3), (
-    f"CRITICAL: transformers {transformers.__version__} < 5.3.0. "
-    f"The KV cache bug makes generation 19x slower. "
-    f"Run: pip install 'transformers>=5.3.0'"
-)
+print(f"USE_TRUST_REMOTE_CODE: {USE_TRUST_REMOTE_CODE}")
 print("✓ All dependencies ready")
 
 # %% [markdown]
@@ -1029,9 +1092,9 @@ gc.collect()
 # %%
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# CRITICAL: Do NOT use trust_remote_code=True
-# The bundled modeling_nemotron_h.py has a cache bug that drops generation to 2 tok/s.
-# transformers >= 5.3.0 has the native implementation that works correctly.
+# USE_TRUST_REMOTE_CODE is set by the dependency cell above.
+# False (preferred): transformers >= 5.3.0 native NemotronH — fast KV cache
+# True (fallback): bundled modeling_nemotron_h.py — requires mamba-ssm
 
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
@@ -1043,6 +1106,11 @@ gc.collect()
 torch.cuda.empty_cache()
 
 print("Loading model...")
+if USE_TRUST_REMOTE_CODE:
+    print("  (trust_remote_code=True — using bundled modeling_nemotron_h.py, transformers native unavailable)")
+    print("  ⚠ Note: bundled impl may have slower KV cache than native transformers>=5.3.0")
+else:
+    print("  (trust_remote_code=False — using native NemotronH from transformers)")
 load_start = time.time()
 
 if USE_4BIT:
@@ -1050,8 +1118,7 @@ if USE_4BIT:
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         device_map="auto",
-        # NO trust_remote_code=True — this is critical!
-        attn_implementation="eager",
+        trust_remote_code=USE_TRUST_REMOTE_CODE,
         low_cpu_mem_usage=True,
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=True,
@@ -1065,8 +1132,7 @@ else:
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         device_map="auto",
-        # NO trust_remote_code=True!
-        attn_implementation="eager",
+        trust_remote_code=USE_TRUST_REMOTE_CODE,
         torch_dtype=torch.bfloat16,
     )
 
