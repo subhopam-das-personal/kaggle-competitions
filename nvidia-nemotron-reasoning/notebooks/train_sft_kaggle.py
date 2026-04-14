@@ -87,6 +87,25 @@ if _tf_ver >= (5, 3):
     print(f"✓ transformers {_tf_ver_str} — native NemotronH (no mamba-ssm needed)")
 else:
     print(f"transformers {_tf_ver_str} < 5.3.0, upgrading for native NemotronH support...")
+    # Try offline wheels dataset first (no internet needed)
+    _WHEELS_DIRS = [
+        "/kaggle/input/nemotron-transformers-wheels",
+        "/kaggle/input/nemotron-transformers-wheels/wheels",
+    ]
+    _upgraded_offline = False
+    for _wdir in _WHEELS_DIRS:
+        if os.path.exists(_wdir) and glob.glob(f"{_wdir}/transformers*.whl"):
+            _res = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-index",
+                 f"--find-links={_wdir}", "transformers>=5.3.0"],
+                capture_output=True, text=True, timeout=120
+            )
+            if _res.returncode == 0:
+                _upgraded_offline = True
+                print(f"✓ transformers installed from offline wheels at {_wdir}")
+                break
+    if not _upgraded_offline:
+        print("  Offline wheels not found, trying PyPI...")
     _result = subprocess.run(
         [sys.executable, "-m", "pip", "install", "--upgrade", "transformers>=5.3.0"],
         capture_output=True, text=True, timeout=300
