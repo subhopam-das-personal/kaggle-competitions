@@ -74,118 +74,72 @@ def pip_install(packages):
             capture_output=True, timeout=300
         )
 
-# Strategy: prefer transformers >= 5.3.0 (native NemotronH, no mamba-ssm needed)
-# This is the correct path for new GPUs like Blackwell (sm_120) where mamba-ssm
-# has no prebuilt wheels and silent PyPI installs produce incompatible binaries.
-USE_TRUST_REMOTE_CODE = False  # Set True only if native transformers path is unavailable
+# Strategy: prefer transformers >= 5.3.0 (native NemotronH, no mamba-ssm needed).
+# Avoids mamba-ssm entirely — no prebuilt wheels exist for Blackwell (sm_120).
+USE_TRUST_REMOTE_CODE = False
 
 import importlib.metadata as _meta
 _tf_ver_str = _meta.version("transformers")
-_tf_ver = tuple(int(x) for x in _tf_ver_str.split('.')[:2])
+_tf_ver = tuple(int(x) for x in _tf_ver_str.split(".")[:2])
 
 if _tf_ver >= (5, 3):
     print(f"✓ transformers {_tf_ver_str} — native NemotronH (no mamba-ssm needed)")
 else:
-    print(f"transformers {_tf_ver_str} < 5.3.0, upgrading for native NemotronH support...")
-    # Try offline wheels dataset first (no internet needed)
-    _WHEELS_DIRS = [
-        "/kaggle/input/nemotron-transformers-wheels",
-        "/kaggle/input/nemotron-transformers-wheels/wheels",
-    ]
+    print(f"transformers {_tf_ver_str} < 5.3.0, need upgrade")
+
+    # Debug: show what input datasets are mounted
+    if os.path.exists("/kaggle/input"):
+        _inputs = os.listdir("/kaggle/input")
+        print(f"  Available /kaggle/input/ entries: {_inputs}")
+    else:
+        print("  /kaggle/input/ does not exist")
+
+    # Search the ENTIRE /kaggle/input/ tree for any transformers wheel
+    _all_tf_wheels = glob.glob("/kaggle/input/**/transformers*.whl", recursive=True)
+    print(f"  Found transformers wheels: {_all_tf_wheels}")
+
     _upgraded_offline = False
-    for _wdir in _WHEELS_DIRS:
-        if os.path.exists(_wdir) and glob.glob(f"{_wdir}/transformers*.whl"):
-            _res = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--no-index",
-                 f"--find-links={_wdir}", "transformers>=5.3.0"],
-                capture_output=True, text=True, timeout=120
-            )
-            if _res.returncode == 0:
-                _upgraded_offline = True
-                print(f"✓ transformers installed from offline wheels at {_wdir}")
-                break
+    if _all_tf_wheels:
+        _wdir = os.path.dirname(_all_tf_wheels[0])
+        print(f"  Installing from offline wheels at {_wdir} ...")
+        _res = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-index",
+             f"--find-links={_wdir}", "transformers>=5.3.0"],
+            capture_output=True, text=True, timeout=120
+        )
+        if _res.returncode == 0:
+            _upgraded_offline = True
+            print("  ✓ transformers installed from offline wheels")
+        else:
+            print(f"  ✗ offline install failed: {_res.stderr[-300:]}")
+
     if not _upgraded_offline:
-        print("  Offline wheels not found, trying PyPI...")
-    _result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "transformers>=5.3.0"],
-        capture_output=True, text=True, timeout=300
-    )
-    # Check new version via subprocess to avoid stale import cache
+        print("  Trying PyPI (may fail if internet is off)...")
+        _result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "transformers>=5.3.0"],
+            capture_output=True, text=True, timeout=300
+        )
+        if _result.returncode != 0:
+            print(f"  ✗ PyPI failed: {_result.stderr[-200:]}")
+
+    # Check version in a fresh subprocess (avoids stale import cache)
     _ver_check = subprocess.run(
         [sys.executable, "-c", "import transformers; print(transformers.__version__)"],
         capture_output=True, text=True
     )
     _new_ver = _ver_check.stdout.strip()
-    _new_tf_ver = tuple(int(x) for x in _new_ver.split('.')[:2]) if _new_ver else (0, 0)
+    _new_tf_ver = tuple(int(x) for x in _new_ver.split(".")[:2]) if _new_ver else (0, 0)
     if _new_tf_ver >= (5, 3):
-        print(f"✓ transformers upgraded to {_new_ver} — native NemotronH, no mamba-ssm needed")
+        print(f"✓ transformers {_new_ver} — native NemotronH")
     else:
-        print(f"⚠ transformers upgrade failed (still {_new_ver or _tf_ver_str}), falling back to mamba-ssm path")
-        if _result.stderr:
-            print(f"  Upgrade error: {_result.stderr[-400:]}")
-        USE_TRUST_REMOTE_CODE = True
-
-# Install mamba-ssm ONLY if the native transformers path is unavailable
-if USE_TRUST_REMOTE_CODE:
-    print("Installing mamba-ssm and causal-conv1d (required for transformers < 5.3.0 path)...")
-
-    _OFFLINE_DIRS = [
-        "/kaggle/input/datasets/dennisfong/nvidia-nemotron-offline-packages/offline_packages/",
-        "/kaggle/usr/lib/notebooks/ryanholbrook/nvidia_utility_script/",
-    ]
-    _mamba_installed = False
-    for _odir in _OFFLINE_DIRS:
-        if os.path.exists(_odir):
-            _wheels = glob.glob(f"{_odir}/**/*causal_conv1d*.whl", recursive=True)
-            _mamba_wheels = glob.glob(f"{_odir}/**/*mamba_ssm*.whl", recursive=True)
-            if _wheels and _mamba_wheels:
-                _res = subprocess.run([sys.executable, "-m", "pip", "install", "--no-index",
-                    f"--find-links={_odir}", "causal-conv1d", "mamba-ssm"],
-                    capture_output=True, text=True)
-                if _res.returncode == 0:
-                    _mamba_installed = True
-                    print(f"✓ Installed from offline packages at {_odir}")
-                break
-
-    if not _mamba_installed:
-        print("Offline packages not found, installing from PyPI...")
-        _res = subprocess.run([sys.executable, "-m", "pip", "install",
-            "causal-conv1d", "mamba-ssm"], capture_output=True, text=True, timeout=600)
-        if _res.returncode == 0:
-            _mamba_installed = True
-            print("✓ Installed from PyPI")
-        else:
-            print(f"✗ PyPI install failed: {_res.stderr[-300:]}")
-
-    # Verify mamba-ssm actually imports (PyPI may install incompatible wheel silently)
-    try:
-        import mamba_ssm
-        import causal_conv1d
-        print("✓ mamba_ssm imported successfully")
-    except ImportError as _e:
-        # Last resort: build from source for the specific GPU compute capability
-        _cc = torch.cuda.get_device_properties(0)
-        _arch = f"{_cc.major}.{_cc.minor}"
-        print(f"Wheels incompatible ({_e}), building from source for sm_{_cc.major}{_cc.minor}...")
-        _env = os.environ.copy()
-        _env["TORCH_CUDA_ARCH_LIST"] = _arch
-        _res = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-build-isolation",
-             "git+https://github.com/Dao-AILab/causal-conv1d.git",
-             "git+https://github.com/state-spaces/mamba.git"],
-            capture_output=True, text=True, timeout=1200, env=_env
+        print(f"✗ transformers upgrade failed. Cannot proceed without transformers>=5.3.0.")
+        print("  → Add the 'nemotron-transformers-wheels' dataset as notebook input:")
+        print("    Notebook → Add Input → Datasets → search 'nemotron-transformers-wheels'")
+        raise RuntimeError(
+            f"transformers upgrade failed (have {_new_ver or _tf_ver_str}, need >=5.3.0). "
+            f"Add 'subhopamdas/nemotron-transformers-wheels' as notebook input. "
+            f"Offline wheels found at: {_all_tf_wheels}"
         )
-        try:
-            import mamba_ssm
-            import causal_conv1d
-            print(f"✓ mamba_ssm compiled from source for sm_{_cc.major}{_cc.minor}")
-        except ImportError:
-            raise RuntimeError(
-                f"Cannot load NemotronH: transformers>=5.3.0 upgrade failed AND "
-                f"mamba-ssm failed to build for sm_{_cc.major}{_cc.minor}.\n"
-                f"Compile errors:\n{_res.stderr[-500:]}\n"
-                f"Fix: ensure internet access, or add 'nvidia-nemotron-offline-packages' as input."
-            )
 
 pip_install([
     "peft>=0.14.0",
