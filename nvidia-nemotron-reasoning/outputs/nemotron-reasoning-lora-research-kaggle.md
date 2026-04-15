@@ -135,3 +135,14 @@ Derived from metric source + competitor findings [S4]:
 [S7] Tong Hui Kang, "[Open Progress Prize Publication] Placeholder post." https://www.kaggle.com/competitions/nvidia-nemotron-model-reasoning-challenge/discussion/689915
 [S8] c-number, "Do not distill models that do not allow distillation …" with CPMP (host) clearance for this competition. https://www.kaggle.com/competitions/nvidia-nemotron-model-reasoning-challenge/discussion/688360 ; lakshmig82, "Open Progress Prize question." https://www.kaggle.com/competitions/nvidia-nemotron-model-reasoning-challenge/discussion/685031
 [S9] NVIDIA Nemotron Model Reasoning Challenge — Overview / Rules. https://www.kaggle.com/competitions/nvidia-nemotron-model-reasoning-challenge/overview
+
+## 8. Dependency setup — competition-recommended approach
+
+**TODO: Fill in from competition overview page.**
+
+The competition page likely references a `support.zip` or utility script for offline dependency installation. The competition host (Ryan Holbrook) has a notebook at `ryanholbrook/nvidia_utility_script` which the original training notebook checks for at:
+- `/kaggle/usr/lib/notebooks/ryanholbrook/nvidia_utility_script/`
+
+Current workaround in place: `subhopamdas/nemotron-transformers-wheels` Kaggle dataset (uploaded 2026-04-14) containing transformers 5.5.4 + deps for Python 3.12 Linux x86_64. Notebook checks this dataset first before falling back to PyPI.
+
+**Action needed:** Check the competition overview page for any official `support.zip` or recommended dataset for offline mamba-ssm / transformers installation. If the competition provides one, add its path to the offline check in cell 4 of `train_sft_kaggle.ipynb`.
